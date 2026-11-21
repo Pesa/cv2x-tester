@@ -53,7 +53,7 @@ def make_driver[D: Driver](cls: type[D], dev: DeviceConfig, ctx: DeviceContext) 
 
 
 # ---------------------------------------------------------------------------
-# Base class, registry and options
+# Registry and options
 # ---------------------------------------------------------------------------
 
 
@@ -89,40 +89,63 @@ def test_required_option_must_not_be_empty():
     assert Kapsch.Options.from_mapping({"interface": ""})[1] == {"interface": "required"}
 
 
-async def test_clock_sources_default(make_ctx):
-    class Plain(Driver):
-        display_name = "Plain"
-
-    dev = DeviceConfig(name="dev", model="plain", host="h", username="u")
-    ctx, ssh, _ = make_ctx(dev, FakeSsh({r"date \+%s\.%N": (0, "1700000000.123456789\n", "")}))
-    sources = Plain(dev, DriverOptions(), ctx).clock_sources()
-    assert [(s.name, s.resolution) for s in sources] == [("date (ns)", "ns"), ("date (s)", "s")]
-    assert await sources[0].read() == pytest.approx(1700000000.123456789)
-    assert ssh.commands == ["date +%s.%N"]
-
-
-async def test_clock_falls_back_to_date_s_if_date_ns_fails(make_ctx):
-    class Plain(Driver):
-        display_name = "Plain"
-
-    dev = DeviceConfig(name="dev", model="plain", host="h", username="u")
-    ssh = FakeSsh(
-        {
-            r"date \+%s\.%N": (1, "", "date: invalid format\n"),
-            r"date \+%s": (0, f"{int(time.time())}\n", ""),
-        }
-    )
-    ctx, _, _ = make_ctx(dev, ssh)
-    sample = await measure_clock(Plain(dev, DriverOptions(), ctx).clock_sources(), samples=1)
-    assert sample.resolution == "s"
-    assert sample.fallbacks == (
-        "'date +%s.%N' failed with exit status 1: date: invalid format; falling back to date (s)",
-    )
-
-
 # ---------------------------------------------------------------------------
-# Cohda MK6
+# Base class
 # ---------------------------------------------------------------------------
+
+
+class Plain(Driver):
+    """A driver that adds nothing to the base class, for testing the base class itself."""
+
+    display_name = "Plain"
+
+
+def plain(make_ctx: DeviceContextFactory, ssh: FakeSsh | None = None) -> tuple[Plain, FakeSsh, list[str]]:
+    """Return a Plain driver on ``ssh`` (a new FakeSsh by default), the FakeSsh, and the list that
+    collects the driver's warnings."""
+    dev = DeviceConfig(name="dev", model="plain", host="h", username="u")
+    ctx, ssh, warnings = make_ctx(dev, ssh)
+    return Plain(dev, DriverOptions(), ctx), ssh, warnings
+
+
+@pytest.mark.parametrize(("is_root", "command"), [(False, "sudo -n id -un"), (True, "id -un")])
+async def test_run_as_root(make_ctx, is_root, command):
+    drv, ssh, _ = plain(make_ctx, FakeSsh({r"(sudo -n )?id -un": (0, "root\n", "")}, is_root=is_root))
+    result = await drv.run_as_root("id -un")
+    assert result.stdout == "root\n"
+    assert ssh.commands == [command]
+
+
+@pytest.mark.parametrize(
+    ("is_root", "stderr", "error"),
+    [
+        pytest.param(
+            False, "sudo: a password is required\n", "passwordless sudo required", id="no-passwordless-sudo"
+        ),
+        pytest.param(
+            False, "line1\ncmd failed\n", "'sudo -n cmd' failed with exit status 2: cmd failed", id="sudo"
+        ),
+        pytest.param(True, "cmd failed\n", "'cmd' failed with exit status 2", id="root"),
+    ],
+)
+async def test_run_as_root_failure(make_ctx, is_root, stderr, error):
+    drv, _, _ = plain(make_ctx, FakeSsh({r"(sudo -n )?cmd": (2, "", stderr)}, is_root=is_root))
+    with pytest.raises(DriverError, match=re.escape(error)):
+        await drv.run_as_root("cmd")
+
+
+@pytest.mark.parametrize(("is_root", "commands"), [(False, ["sudo -n true"]), (True, [])])
+async def test_check_root_privileges(make_ctx, is_root, commands):
+    drv, ssh, _ = plain(make_ctx, FakeSsh(is_root=is_root))
+    await drv.check_root_privileges()
+    assert ssh.commands == commands
+
+
+async def test_check_root_privileges_requires_passwordless_sudo(make_ctx):
+    drv, _, _ = plain(make_ctx, FakeSsh({r"sudo -n true": (1, "", "sudo: a password is required\n")}))
+    with pytest.raises(DriverError, match="passwordless sudo required"):
+        await drv.check_root_privileges()
+
 
 # Matches cv2x_get_status, with or without sudo.
 CV2X_STATUS = r"(sudo -n )?cv2x_get_status"
@@ -134,6 +157,168 @@ def cv2x_status(rx: str = "Active", tx: str = "Active") -> Response:
     return 0, f"C-V2X Status:\n  RX : {rx}\n  TX : {tx}\n", ""
 
 
+@pytest.mark.parametrize(
+    "out",
+    [
+        pytest.param("C-V2X Status:\n  RX : Active\n  TX : Active\n", id="sample"),
+        pytest.param("C-V2X Status:\r\n  RX : ACTIVE\r\n  TX : active\r\n", id="case-crlf"),
+        pytest.param("TX:Active\nRX:Active", id="no-spaces"),
+        pytest.param("\n \n\tRX\t:\tActive   \r\r TX :Active \t\n\n", id="whitespace-blank-lines"),
+        pytest.param("C-V2X Status:\n  RX : Active (since boot)\n  TX : ACTIVE.\n", id="text-after-active"),
+        pytest.param("RX : Active\nTX : Active\nRX : Active\nTX: active\n", id="repeated-lines"),
+        pytest.param(
+            "Starting\nRX status: SUSPENDED\nC-V2X Status:\n  RX : Active\n  TX : Active\nDone\n",
+            id="unrelated-lines",
+        ),
+    ],
+)
+async def test_check_cv2x_status_active(make_ctx, out):
+    drv, ssh, _ = plain(make_ctx, FakeSsh({CV2X_STATUS: (0, out, "")}))
+    await drv.check_cv2x_status()
+    assert ssh.commands == ["cv2x_get_status"]
+
+
+@pytest.mark.parametrize(
+    ("rx", "tx", "listed"),
+    [
+        ("SUSPENDED", "SUSPENDED", "RX SUSPENDED, TX SUSPENDED"),
+        ("Active", "Suspended", "TX Suspended"),
+        ("Inactive", "Active", "RX Inactive"),
+        ("Unknown", "Unknown", "RX Unknown, TX Unknown"),
+    ],
+)
+async def test_check_cv2x_status_not_active(make_ctx, rx, tx, listed):
+    drv, _, _ = plain(make_ctx, FakeSsh({CV2X_STATUS: cv2x_status(rx, tx)}))
+    with pytest.raises(DeviceNotReady) as excinfo:
+        await drv.check_cv2x_status()
+    assert str(excinfo.value) == f"C-V2X radio not active ({listed})"
+
+
+@pytest.mark.parametrize(
+    ("out", "listed"),
+    [
+        pytest.param(
+            "RX : Active\nTX : Active\nRX : Suspended\n", "RX Suspended", id="repeated-one-not-active"
+        ),
+        pytest.param(
+            "RX : Not available\nTX : Active (since boot)\n", "RX Not available", id="several-words"
+        ),
+        pytest.param("RX : Activated\nTX : Active\n", "RX Activated", id="longer-word"),
+        pytest.param(
+            "RX: 1234 packets\nC-V2X Status:\n  RX : Active\n  TX : Active\n",
+            "RX 1234 packets",
+            id="unrelated-rx-line",
+        ),
+    ],
+)
+async def test_check_cv2x_status_not_active_lines(make_ctx, out, listed):
+    drv, _, _ = plain(make_ctx, FakeSsh({CV2X_STATUS: (0, out, "")}))
+    with pytest.raises(DeviceNotReady) as excinfo:
+        await drv.check_cv2x_status()
+    assert str(excinfo.value) == f"C-V2X radio not active ({listed})"
+
+
+@pytest.mark.parametrize(
+    ("response", "detail"),
+    [
+        pytest.param((0, "", ""), "no RX or TX state", id="empty"),
+        pytest.param((0, "C-V2X Status:\n  RX : Active\n", ""), "no TX state", id="no-tx"),
+        pytest.param((0, "C-V2X Status:\n  RX :\n  TX : Active\n", ""), "no RX state", id="empty-state"),
+        pytest.param(
+            (0, "C-V2X Status:\n  rx : Active\n  tx : Active\n", ""),
+            "no RX or TX state",
+            id="lowercase-labels",
+        ),
+        pytest.param(
+            (0, "", "C-V2X Status:\n  RX : Active\n  TX : Active\n"), "no RX or TX state", id="stderr-only"
+        ),
+    ],
+)
+async def test_check_cv2x_status_unexpected_output(make_ctx, response, detail):
+    drv, _, _ = plain(make_ctx, FakeSsh({CV2X_STATUS: response}))
+    with pytest.raises(DriverError) as excinfo:
+        await drv.check_cv2x_status()
+    assert excinfo.type is DriverError
+    assert str(excinfo.value) == f"unexpected 'cv2x_get_status' output: {detail}"
+
+
+async def test_check_cv2x_status_command_failure(make_ctx):
+    drv, _, _ = plain(make_ctx, FakeSsh({CV2X_STATUS: (2, "", "radio down\n")}))
+    with pytest.raises(DriverError, match="'cv2x_get_status' failed with exit status 2"):
+        await drv.check_cv2x_status()
+
+
+@pytest.mark.parametrize(
+    ("is_root", "command"), [(False, "sudo -n cv2x_get_status"), (True, "cv2x_get_status")]
+)
+async def test_check_cv2x_status_as_root(make_ctx, is_root, command):
+    drv, ssh, _ = plain(make_ctx, FakeSsh({CV2X_STATUS: cv2x_status()}, is_root=is_root))
+    await drv.check_cv2x_status(as_root=True)
+    assert ssh.commands == [command]
+
+
+@pytest.mark.parametrize(
+    ("as_root", "is_root", "command"),
+    [
+        (False, False, "cat /logs/rx.pcap"),
+        (False, True, "cat /logs/rx.pcap"),
+        (True, False, "sudo -n cat /logs/rx.pcap"),
+        (True, True, "cat /logs/rx.pcap"),
+    ],
+)
+async def test_download(make_ctx, tmp_path, as_root, is_root, command):
+    drv, ssh, warnings = plain(make_ctx, FakeSsh(files={"/logs/rx.pcap": b"rx"}, is_root=is_root))
+    path = await drv.download("/logs/rx.pcap", tmp_path, as_root=as_root)
+    assert path == tmp_path / "rx.pcap"
+    assert (tmp_path / "rx.pcap").read_bytes() == b"rx"
+    assert ssh.commands == [command]
+    assert warnings == []
+    assert not drv.ctx.download_failed
+
+
+async def test_download_with_name(make_ctx, tmp_path):
+    drv, _, _ = plain(make_ctx, FakeSsh(files={"/logs/rx.pcap": b"rx"}))
+    path = await drv.download("/logs/rx.pcap", tmp_path, name="obu1-rx.pcap")
+    assert path == tmp_path / "obu1-rx.pcap"
+    assert (tmp_path / "obu1-rx.pcap").read_bytes() == b"rx"
+
+
+async def test_download_missing_file(make_ctx, tmp_path):
+    drv, _, warnings = plain(make_ctx)
+    assert await drv.download("/logs/rx.pcap", tmp_path) is None
+    assert warnings == ["cannot read /logs/rx.pcap: No such file or directory"]
+    assert drv.ctx.download_failed
+    assert not (tmp_path / "rx.pcap").exists()
+
+
+async def test_clock_sources_default(make_ctx):
+    drv, ssh, _ = plain(make_ctx, FakeSsh({r"date \+%s\.%N": (0, "1700000000.123456789\n", "")}))
+    sources = drv.clock_sources()
+    assert [(s.name, s.resolution) for s in sources] == [("date (ns)", "ns"), ("date (s)", "s")]
+    assert await sources[0].read() == pytest.approx(1700000000.123456789)
+    assert ssh.commands == ["date +%s.%N"]
+
+
+async def test_clock_falls_back_to_date_s_if_date_ns_fails(make_ctx):
+    ssh = FakeSsh(
+        {
+            r"date \+%s\.%N": (1, "", "date: invalid format\n"),
+            r"date \+%s": (0, f"{int(time.time())}\n", ""),
+        }
+    )
+    drv, _, _ = plain(make_ctx, ssh)
+    sample = await measure_clock(drv.clock_sources(), samples=1)
+    assert sample.resolution == "s"
+    assert sample.fallbacks == (
+        "'date +%s.%N' failed with exit status 1: date: invalid format; falling back to date (s)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cohda MK6
+# ---------------------------------------------------------------------------
+
+
 def cohda(
     make_ctx: DeviceContextFactory,
     ssh: FakeSsh | None = None,
@@ -142,8 +327,9 @@ def cohda(
     check_gps: bool = True,
     **kw: bool,
 ) -> tuple[CohdaMk6, FakeSsh, list[str]]:
-    """Return a Cohda MK6 driver on ``ssh`` (by default, a new FakeSsh), with its FakeSsh and the
-    list of its warnings. The C-V2X radio is active unless ``ssh`` answers cv2x_get_status itself."""
+    """Return a Cohda MK6 driver on ``ssh`` (a new FakeSsh by default), the FakeSsh, and the list
+    that collects the driver's warnings. The C-V2X radio is active unless ``ssh`` answers
+    cv2x_get_status itself."""
     dev = DeviceConfig(
         name="obu1", model="cohda-mk6", role=role, host="h", username="user", options={"check_gps": check_gps}
     )
@@ -165,137 +351,11 @@ async def test_cohda_precheck(make_ctx):
     assert "sudo -n kinematics-sample-client -a -n 1" not in ssh.commands
 
 
-async def test_cohda_precheck_requires_passwordless_sudo(make_ctx):
-    ssh = FakeSsh({r"sudo -n true": (1, "", "sudo: a password is required\n")})
-    drv, _, _ = cohda(make_ctx, ssh)
-    with pytest.raises(DriverError, match="passwordless sudo required"):
+async def test_cohda_precheck_radio_not_active(make_ctx):
+    drv, ssh, _ = cohda(make_ctx, FakeSsh({CV2X_STATUS: cv2x_status("SUSPENDED", "Active")}))
+    with pytest.raises(DeviceNotReady, match=re.escape("C-V2X radio not active (RX SUSPENDED)")):
         await drv.precheck()
-
-
-async def test_cohda_precheck_failure(make_ctx):
-    ssh = FakeSsh({r"sudo -n cv2x_get_status": (2, "", "line1\nradio down\n")})
-    drv, _, _ = cohda(make_ctx, ssh)
-    with pytest.raises(DriverError, match="exit status 2: radio down"):
-        await drv.precheck()
-
-
-async def test_cohda_root_login_runs_commands_without_sudo(make_ctx, tmp_path):
-    remote = "/tmp/log/run1"
-    ssh = FakeSsh(
-        {rf"readlink -en {LOG_DIR}": (0, remote, "")},
-        files={f"{remote}/rx_pc5.pcap": b"rx", f"{remote}/tx_pc5.pcap": b"tx"},
-        is_root=True,
-    )
-    drv, ssh, warnings = cohda(make_ctx, ssh, role="rsu")
-    await drv.precheck()
-    await drv.start_test()
-    await drv.stop_test()
-    await drv.collect(tmp_path)
-    await drv.cleanup()
-    assert ssh.commands == [
-        "cv2x_get_status",
-        "kinematics-sample-client -a -n 1",
-        f"{RC_SCRIPT} start rsu",
-        f"readlink -en {LOG_DIR}",
-        f"{RC_SCRIPT} stop rsu",
-        f"cat {remote}/rx_pc5.pcap",
-        f"cat {remote}/tx_pc5.pcap",
-        f"rm -fr {remote}",
-    ]
-    assert warnings == []
-
-
-async def test_cohda_root_login_precheck_failure(make_ctx):
-    ssh = FakeSsh({r"cv2x_get_status": (2, "", "radio down\n")}, is_root=True)
-    drv, _, _ = cohda(make_ctx, ssh)
-    with pytest.raises(DriverError, match="'cv2x_get_status' failed with exit status 2"):
-        await drv.precheck()
-
-
-@pytest.mark.parametrize(
-    "out",
-    [
-        pytest.param("C-V2X Status:\n  RX : Active\n  TX : Active\n", id="sample"),
-        pytest.param("C-V2X Status:\r\n  RX : ACTIVE\r\n  TX : active\r\n", id="case-crlf"),
-        pytest.param("TX:Active\nRX:Active", id="no-spaces"),
-        pytest.param("\n \n\tRX\t:\tActive   \r\r TX :Active \t\n\n", id="whitespace-blank-lines"),
-        pytest.param("C-V2X Status:\n  RX : Active (since boot)\n  TX : ACTIVE.\n", id="text-after-active"),
-        pytest.param("RX : Active\nTX : Active\nRX : Active\nTX: active\n", id="repeated-lines"),
-        pytest.param(
-            "Starting\nRX status: SUSPENDED\nC-V2X Status:\n  RX : Active\n  TX : Active\nDone\n",
-            id="unrelated-lines",
-        ),
-    ],
-)
-async def test_cv2x_status_active(make_ctx, out):
-    drv, ssh, _ = cohda(make_ctx, FakeSsh({CV2X_STATUS: (0, out, "")}))
-    await drv.precheck()
-    assert "sudo -n kinematics-sample-client -a -n 1" in ssh.commands
-
-
-@pytest.mark.parametrize(
-    ("rx", "tx", "listed"),
-    [
-        ("SUSPENDED", "SUSPENDED", "RX SUSPENDED, TX SUSPENDED"),
-        ("Active", "Suspended", "TX Suspended"),
-        ("Inactive", "Active", "RX Inactive"),
-        ("Unknown", "Unknown", "RX Unknown, TX Unknown"),
-    ],
-)
-async def test_cv2x_status_not_active(make_ctx, rx, tx, listed):
-    drv, ssh, _ = cohda(make_ctx, FakeSsh({CV2X_STATUS: cv2x_status(rx, tx)}))
-    with pytest.raises(DeviceNotReady) as excinfo:
-        await drv.precheck()
-    assert str(excinfo.value) == f"C-V2X radio not active ({listed})"
     assert ssh.commands == ["sudo -n true", "sudo -n cv2x_get_status"]
-
-
-@pytest.mark.parametrize(
-    ("out", "listed"),
-    [
-        pytest.param(
-            "RX : Active\nTX : Active\nRX : Suspended\n", "RX Suspended", id="repeated-one-not-active"
-        ),
-        pytest.param(
-            "RX : Not available\nTX : Active (since boot)\n", "RX Not available", id="several-words"
-        ),
-        pytest.param("RX : Activated\nTX : Active\n", "RX Activated", id="longer-word"),
-        pytest.param(
-            "RX: 1234 packets\nC-V2X Status:\n  RX : Active\n  TX : Active\n",
-            "RX 1234 packets",
-            id="unrelated-rx-line",
-        ),
-    ],
-)
-async def test_cv2x_status_not_active_lines(make_ctx, out, listed):
-    drv, _, _ = cohda(make_ctx, FakeSsh({CV2X_STATUS: (0, out, "")}))
-    with pytest.raises(DeviceNotReady) as excinfo:
-        await drv.precheck()
-    assert str(excinfo.value) == f"C-V2X radio not active ({listed})"
-
-
-@pytest.mark.parametrize(
-    ("response", "detail"),
-    [
-        pytest.param((0, "", ""), "no RX or TX state", id="empty"),
-        pytest.param((0, "C-V2X Status:\n  RX : Active\n", ""), "no TX state", id="no-tx"),
-        pytest.param((0, "C-V2X Status:\n  RX :\n  TX : Active\n", ""), "no RX state", id="empty-state"),
-        pytest.param(
-            (0, "C-V2X Status:\n  rx : Active\n  tx : Active\n", ""),
-            "no RX or TX state",
-            id="lowercase-labels",
-        ),
-        pytest.param(
-            (0, "", "C-V2X Status:\n  RX : Active\n  TX : Active\n"), "no RX or TX state", id="stderr-only"
-        ),
-    ],
-)
-async def test_cv2x_status_unexpected_output(make_ctx, response, detail):
-    drv, _, _ = cohda(make_ctx, FakeSsh({CV2X_STATUS: response}))
-    with pytest.raises(DriverError) as excinfo:
-        await drv.precheck()
-    assert excinfo.type is DriverError
-    assert str(excinfo.value) == f"unexpected 'cv2x_get_status' output: {detail}"
 
 
 async def test_cohda_full_cycle(make_ctx, tmp_path):
@@ -848,28 +908,6 @@ async def test_rmnet_stream_cycle(make_ctx, tmp_path, driver):
     assert len(pcap_packets(tmp_path / "rsu5_raw" / "rmnet_data1.pcap")) == 2
     assert ctx.failures == []
     assert warnings == []
-
-
-@pytest.mark.parametrize("driver", [Kapsch, Ettifos])
-async def test_rmnet_precheck_requires_passwordless_sudo(make_ctx, driver):
-    dev = DeviceConfig(name="rsu5", model=driver.model_id, role="rsu", host="h", username="u")
-    ssh = FakeSsh({r"sudo -n true": (1, "", "sudo: a password is required\n")})
-    ctx, _, _ = make_ctx(dev, ssh)
-    drv = make_driver(driver, dev, ctx)
-    with pytest.raises(DriverError, match="passwordless sudo required"):
-        await drv.precheck()
-
-
-@pytest.mark.parametrize("driver", [Kapsch, Ettifos])
-async def test_rmnet_root_login_runs_tcpdump_without_sudo(make_ctx, driver):
-    dev = DeviceConfig(name="rsu5", model=driver.model_id, role="rsu", host="h", username="root")
-    ctx, ssh, _ = make_ctx(dev, FakeSsh(is_root=True))
-    drv = make_driver(driver, dev, ctx)
-    await drv.precheck()
-    await drv.start_capture()
-    await drv.stop_capture()
-    assert ssh.commands == ["command -v tcpdump", tcpdump_command("rmnet_data1"), "kill -INT 4242"]
-    assert ctx.failures == []
 
 
 async def test_yunex_captures_rx_and_tx(make_ctx, tmp_path):
